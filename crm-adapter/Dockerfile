@@ -6,4 +6,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY shared ./shared
 COPY . .
 EXPOSE 8010
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8010"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8010}"]
