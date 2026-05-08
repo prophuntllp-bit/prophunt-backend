@@ -3,6 +3,6 @@ uvicorn[standard]==0.30.6
 faster-whisper==1.0.3
 soundfile==0.12.1
 numpy==2.1.2
-torch==2.4.1
+torch>=2.5.0
 librosa==0.10.2.post1
 python-multipart==0.0.20
