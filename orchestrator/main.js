@@ -10,6 +10,15 @@ const FormData = require("form-data");
 const Redis = require("ioredis");
 const { Counter, Histogram, Registry, collectDefaultMetrics } = require("prom-client");
 const { LanguageManager } = require("./language-manager");
+const { v2: cloudinary } = require("cloudinary");
+
+if (process.env.CLOUDINARY_CLOUD_NAME) {
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+}
 
 const config = {
   port: parseInt(process.env.PORT || "8000", 10),
@@ -876,6 +885,22 @@ async function recordAgentAudio(session, wavBuffer, label = "agent-media") {
   return appendRecordingAudio(session, "agent", resamplePcm16(pcm, sampleRate, 16000), label);
 }
 
+async function uploadRecordingToCloudinary(filePath, callSid) {
+  if (!process.env.CLOUDINARY_CLOUD_NAME || !fs.existsSync(filePath)) return null;
+  try {
+    const result = await cloudinary.uploader.upload(filePath, {
+      resource_type: "video", // Cloudinary uses "video" for audio files
+      folder: "call-recordings",
+      public_id: `${callSid}/mixed`,
+      overwrite: true,
+    });
+    return result.secure_url;
+  } catch (err) {
+    console.error("[cloudinary] upload failed:", err.message);
+    return null;
+  }
+}
+
 async function finalizeRecording(session) {
   if (!session?.recording || session.recording.finalized) {
     return session?.recordings || null;
@@ -914,6 +939,13 @@ async function endCall(session, finalStatus = "completed") {
   session.status = finalStatus;
   session.endedAt = nowIso();
   await finalizeRecording(session);
+  if (session.recordings?.mixed_path) {
+    const cloudUrl = await uploadRecordingToCloudinary(session.recordings.mixed_path, session.callSid);
+    if (cloudUrl) {
+      session.recordingPath = cloudUrl;
+      session.recordings.mixed_url = cloudUrl;
+    }
+  }
   const durationSec = Math.max(1, Math.round((Date.now() - session.startedTs) / 1000));
   callsTotal.labels(finalStatus).inc();
   callDuration.observe(durationSec);
