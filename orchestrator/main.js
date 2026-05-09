@@ -661,9 +661,19 @@ function buildRuleBasedReply(session, userText = "") {
       `Koi baat nahi. Aapka shukriya. Namaste.`
     );
   }
+  // If already in open_discovery and lead's reply is unclear, move conversation forward
+  if (guidedState === "open_discovery") {
+    session.guidedState = "awaiting_configuration";
+    return T(
+      `Are you interested in a two BHK or three BHK at ${project}? I can share the current pricing.`,
+      `${project} mein do BHK ka interest hai ya teen BHK ka? Main rate bata sakti hoon.`
+    );
+  }
+  // Generic fallback — only reached if guidedState is null and nothing matched
+  session.guidedState = "open_discovery";
   return T(
-    `I can help with price, location, or site visit details. What would you like to know?`,
-    `Main rate, location ya site visit ke baare mein bata sakti hoon. Kya jaanna chahenge?`
+    `I can help with price, location, or site visit details for ${project}. What would you like to know?`,
+    `Main ${project} ke baare mein rate, location ya site visit ki jaankari de sakti hoon. Kya jaanna chahenge?`
   );
 }
 
@@ -1251,11 +1261,25 @@ async function processCallerUtterance(ws, session, callSid, reason = "utterance"
   inbound.silenceFrames = 0;
   inbound.lastFlushAt = Date.now();
 
+  // Skip utterances that are too short to contain meaningful speech (< 0.5s of audio)
+  const MIN_UTTERANCE_BYTES = 8000;
+  if (utteranceAudio.length < MIN_UTTERANCE_BYTES) {
+    console.log(`[enablex-media] skipping short utterance callSid=${callSid} reason=${reason} bytes=${utteranceAudio.length}`);
+    inbound.processing = false;
+    return;
+  }
+
   try {
     console.log(`[enablex-media] processing caller utterance callSid=${callSid} reason=${reason} bytes=${utteranceAudio.length}`);
     const transcription = await transcribeAudio(utteranceAudio, "auto");
     console.log(`[stt] caller utterance callSid=${callSid} text="${transcription.text || ""}" language=${transcription.language || ""}`);
     if (!transcription.text) return;
+    // Skip transcriptions that are too short — likely noise or fragment (< 3 meaningful words)
+    const wordCount = transcription.text.trim().split(/\s+/).filter(w => w.length > 1).length;
+    if (wordCount < 3) {
+      console.log(`[enablex-media] skipping fragment callSid=${callSid} words=${wordCount} text="${transcription.text}"`);
+      return;
+    }
     languageManager.recordUtterance(callSid, transcription.language, transcription.text);
     session.stage = "qualification";
     let reply = await getLLMResponse(session, transcription.text);
@@ -1296,12 +1320,18 @@ async function processCallerUtterance(ws, session, callSid, reason = "utterance"
     if (currentInbound) {
       currentInbound.processing = false;
       currentInbound.lastFlushAt = Date.now();
-      if (currentInbound.chunks.length && ws.readyState === WebSocket.OPEN && !session.closed) {
+      const queuedBytes = currentInbound.chunks.reduce((s, c) => s + c.length, 0);
+      if (queuedBytes > MIN_UTTERANCE_BYTES && ws.readyState === WebSocket.OPEN && !session.closed) {
         setImmediate(() => {
           processCallerUtterance(ws, session, callSid, "queued-after-processing").catch((error) =>
             console.warn("[enablex-media] queued utterance failed", { callSid, message: error.message })
           );
         });
+      } else if (currentInbound.chunks.length) {
+        // Discard tiny queued fragments — they're noise from the agent's playback period
+        currentInbound.chunks = [];
+        currentInbound.speechFrames = 0;
+        currentInbound.silenceFrames = 0;
       }
     }
   }
@@ -1344,9 +1374,12 @@ async function handleCallerAudioFrame(ws, session, callSid, audioBuffer) {
   if (!isCollecting) return;
   inbound.silenceFrames += 1;
   const bufferedMs = inbound.chunks.length * 20;
-  const enoughSpeech = inbound.speechFrames >= 3 || bufferedMs >= 700;
-  const endedBySilence = inbound.silenceFrames >= 6;
-  const tooLong = bufferedMs >= 2200;
+  // Require at least 12 speech frames (240ms) before considering an utterance valid
+  const enoughSpeech = inbound.speechFrames >= 12 || bufferedMs >= 2000;
+  // Wait for 25 silence frames (500ms) before cutting — prevents chopping mid-sentence
+  const endedBySilence = inbound.silenceFrames >= 25;
+  // Allow up to 10 seconds of buffering for long utterances
+  const tooLong = bufferedMs >= 10000;
 
   if ((enoughSpeech && endedBySilence) || tooLong) {
     await processCallerUtterance(ws, session, callSid, endedBySilence ? "silence" : "max-buffer");
