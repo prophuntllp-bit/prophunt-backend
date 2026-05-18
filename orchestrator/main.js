@@ -1461,6 +1461,13 @@ app.post("/call/dial", async (req, res) => {
     return res.status(400).json({ error: "lead.phone is required" });
   }
   const session = createSession(lead, req.body.campaign || {});
+  // Store KB context / dynamic variables from dashboard for Agni injection
+  if (req.body.dynamic_variables && typeof req.body.dynamic_variables === 'object') {
+    session.dynamicVariables = req.body.dynamic_variables;
+    if (req.body.dynamic_variables.knowledge_base) {
+      console.log(`[dial] KB context attached (${req.body.dynamic_variables.knowledge_base.length} chars)`);
+    }
+  }
   await persistSession(session);
   const greeting = await getOpeningMessage(session);
   session.pendingGreetingAudio = await synthesizeSpeech(session, greeting);
@@ -1626,16 +1633,24 @@ wss.on("connection", (ws, req) => {
           // ── Agni mode: create LiveKit session, skip local greeting synthesis ──
           if (config.agni.enabled) {
             try {
+              // Base vars + any KB context passed from the dashboard at dial time
+              const agniDynamicVars = {
+                lead_name:    session.lead?.name || "there",
+                phone:        session.lead?.phone || "",
+                project:      session.campaign?.name || session.campaign?.project_name || session.lead?.project || "",
+                language:     session.lead?.language || session.lead?.language_preference || "english",
+                opening_line: session.campaign?.opening_line || session.campaign?.openingLine || "",
+                // Merge KB context + any other vars from the dashboard dial request
+                ...(session.dynamicVariables || {}),
+              };
+              if (agniDynamicVars.knowledge_base) {
+                console.log(`[agni-bridge] injecting KB context callSid=${voiceId} chars=${agniDynamicVars.knowledge_base.length}`);
+              }
               const agniSession = await createAgniSession({
-                apiKey: config.agni.apiKey,
-                agentId: config.agni.agentId,
-                callSid: voiceId,
-                dynamicVariables: {
-                  lead_name: session.lead?.name || "there",
-                  phone: session.lead?.phone || "",
-                  project: session.campaign?.name || session.lead?.project || "",
-                  language: session.lead?.language || "english",
-                },
+                apiKey:           config.agni.apiKey,
+                agentId:          config.agni.agentId,
+                callSid:          voiceId,
+                dynamicVariables: agniDynamicVars,
               });
               console.log(`[agni-bridge] session created callSid=${voiceId} agni_session=${agniSession.session_id}`);
               session.agniSessionId = agniSession.session_id;
