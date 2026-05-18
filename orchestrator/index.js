@@ -11,6 +11,7 @@ const axios = require('axios');
 const FormData = require('form-data');
 const { EventEmitter } = require('events');
 const twilio = require('twilio');
+const { createAgniSession } = require('./agni-bridge');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const config = {
@@ -426,10 +427,71 @@ app.post('/call/connected', async (req, res) => {
 
 // Initiate outbound call
 app.post('/call/dial', async (req, res) => {
-  const { lead_id, phone, project, voice_id } = req.body;
+  const { lead, phone: rawPhone, project, voice_id, opening_line, dynamic_variables, kb_id } = req.body;
+  const phone = lead?.phone || rawPhone;
 
   if (sessions.size >= config.maxConcurrentCalls) {
     return res.status(503).json({ error: 'capacity_full', active: sessions.size });
+  }
+
+  // ── Agni path: use Ravan.ai if credentials are configured ────────────────
+  const agniKey    = process.env.AGNI_API_KEY;
+  const agniAgent  = process.env.AGNI_AGENT_ID;
+
+  if (agniKey && agniAgent) {
+    try {
+      const callSid = `agni_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
+
+      // Build dynamic variables: merge caller info + KB context
+      const dynVars = {
+        lead_name:    lead?.name    || 'Lead',
+        project_name: lead?.project || project || '',
+        language:     lead?.language || 'Hindi',
+        opening_line: opening_line  || '',
+        ...(dynamic_variables || {}),
+      };
+
+      console.log(`[Agni] Creating session for ${phone}, KB attached: ${!!dynVars.knowledge_base}`);
+
+      const session = await createAgniSession({
+        apiKey:           agniKey,
+        agentId:          agniAgent,
+        callSid,
+        dynamicVariables: dynVars,
+      });
+
+      // Store session info so the frontend can poll it
+      sessions.set(callSid, {
+        callSid,
+        lead: lead || { phone, name: 'Lead' },
+        state: 'initiated',
+        agniSession: session,
+        startTime: Date.now(),
+        getDurationSec() { return Math.round((Date.now() - this.startTime) / 1000); },
+      });
+
+      console.log(`[Agni] Session created: ${session.session_id}, LiveKit URL: ${session.url}`);
+      return res.json({
+        success:    true,
+        call_sid:   callSid,
+        session_id: session.session_id,
+        livekit_url: session.url,
+        access_token: session.access_token,
+        provider:   'agni',
+        kb_attached: !!dynVars.knowledge_base,
+      });
+    } catch (err) {
+      console.error('[Agni] Session creation failed:', err.message);
+      return res.status(500).json({ error: `Agni error: ${err.message}`, provider: 'agni' });
+    }
+  }
+
+  // ── Twilio fallback: use Twilio if Agni not configured ───────────────────
+  if (!config.twilio.accountSid || !config.twilio.authToken) {
+    return res.status(503).json({
+      error: 'No calling provider configured. Set AGNI_API_KEY + AGNI_AGENT_ID (or Twilio creds) in Railway env vars.',
+      hint: 'Go to Railway dashboard → orchestrator service → Variables',
+    });
   }
 
   try {
@@ -443,7 +505,7 @@ app.post('/call/dial', async (req, res) => {
     });
 
     console.log(`Dialing ${phone} → CallSid: ${call.sid}`);
-    res.json({ success: true, call_sid: call.sid });
+    res.json({ success: true, call_sid: call.sid, provider: 'twilio' });
   } catch (err) {
     console.error('Dial error:', err.message);
     res.status(500).json({ error: err.message });
@@ -499,6 +561,21 @@ app.post('/call/status', async (req, res) => {
   }
 
   res.sendStatus(200);
+});
+
+// Session status — polled by dashboard after call is placed
+app.get('/sessions/:sid', (req, res) => {
+  const s = sessions.get(req.params.sid);
+  if (!s) return res.status(404).json({ error: 'session_not_found' });
+  res.json({
+    call_sid:     s.callSid,
+    state:        s.state || 'active',
+    duration_sec: s.getDurationSec ? s.getDurationSec() : 0,
+    lead:         s.lead,
+    provider:     s.agniSession ? 'agni' : 'sarvam',
+    session_id:   s.agniSession?.session_id || null,
+    livekit_url:  s.agniSession?.url || null,
+  });
 });
 
 // Health + metrics
