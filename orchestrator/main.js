@@ -383,28 +383,34 @@ function nowIso() {
 }
 
 function buildSystemPrompt(lead, knowledgeContext, language) {
-  return `You are a real estate sales consultant calling on behalf of ${lead.developer || "our firm"}.
+  const hasKB = knowledgeContext && knowledgeContext.trim().length > 30;
+  const lang = String(language || lead.language_preference || "auto").toLowerCase();
+  const respondInHindi = lang === "hi" || lang === "hindi" || lang === "hi-in";
+  const languageInstruction = respondInHindi
+    ? "IMPORTANT: The lead is speaking Hindi. Always reply in Hindi (Devanagari or Hinglish). Never switch to English."
+    : "Mirror the lead's language — respond in the same language they use.";
 
-PROJECT KNOWLEDGE:
-${knowledgeContext || "No specific project data loaded."}
+  return `You are Priya, a real estate sales consultant calling on behalf of ${lead.developer || "Prophunt"}.
+
+${hasKB ? "PROJECT KNOWLEDGE (use this to answer questions — do NOT say you will check later):\n" + knowledgeContext : "PROJECT: " + (lead.project || "our project")}
 
 LEAD INFO:
 - Name: ${lead.name}
-- Phone: ${lead.phone}
 - Project Interest: ${lead.project || "Unknown"}
 - Budget: ${lead.budget || "not discussed yet"}
-- Language: ${language || lead.language_preference || "auto-detect"}
 
-CONVERSATION STRATEGY:
-1. Open warmly and use the lead name.
-2. Ask one qualification question at a time.
-3. Keep every reply under 3 sentences.
-4. Mirror the lead's language naturally.
-5. Never invent prices or possession dates.
-6. Close toward a site visit or callback with specific options.
-7. If asked whether you are AI, say you are calling from the developer's team.
+${languageInstruction}
 
-Return an invisible JSON payload when the conversation is ready to close:
+RULES (strictly follow):
+1. Keep EVERY reply under 2 sentences. Be concise and direct.
+2. Use the PROJECT KNOWLEDGE above to answer pricing, size, and configuration questions directly.
+3. NEVER say "ek minute mein check karti hoon", "let me check", "I will check", "main check karti hoon" or any stalling phrase. You have the information — use it.
+4. If the lead asks for price, give the actual price from PROJECT KNOWLEDGE. If price is not in knowledge base, say the sales team will share a detailed quote.
+5. Ask one qualification question at a time — BHK preference or site visit interest.
+6. Close toward a site visit: offer specific days ("aaj ya kal?").
+7. If asked if you are AI, say you are calling from the developer's team.
+
+Return this JSON silently when closing:
 OUTCOME:{"status":"interested","site_visit":false,"callback_date":null,"qualification":{"bhk":"","budget_range":"","purpose":"","timeline":""},"notes":""}`;
 }
 
@@ -611,11 +617,22 @@ async function transcribeAudioDirect(audioBuffer, language = "auto") {
   }
 }
 
+// Extract a short price snippet from KB context (used to make guided replies KB-aware)
+function extractPriceFromKB(knowledgeBase = "") {
+  if (!knowledgeBase) return null;
+  // Look for price patterns: ₹X Cr, ₹X lakh, X crore, X lacs, etc.
+  const priceMatch = knowledgeBase.match(/(?:starting|starts?|from|price|rate|cost)[^\n.]{0,60}(?:₹|rs\.?|inr)\s*[\d,.]+\s*(?:cr(?:ore)?|lakh?|lac|l)/i)
+    || knowledgeBase.match(/(?:₹|rs\.?|inr)\s*[\d,.]+\s*(?:cr(?:ore)?|lakh?|lac|l)[^\n.]{0,60}/i)
+    || knowledgeBase.match(/(?:2bhk|3bhk|two bhk|three bhk)[^\n.]{0,80}(?:₹|rs\.?|inr)/i);
+  return priceMatch ? priceMatch[0].trim() : null;
+}
+
 function buildRuleBasedReply(session, userText = "") {
   const text = String(userText || "").toLowerCase();
   const project = session.lead?.project || session.campaign?.project_name || "the project";
   const lang = languageManager.getBaseLanguage(session.callSid);
   const isHindi = lang === "hi";
+  const kbPriceSnippet = extractPriceFromKB(session.dynamicVariables?.knowledge_base || "");
 
   const wantsConfiguration = /(?:\b|[^a-z0-9])(?:1|one|ek|2|two|do|3|three|teen|4|four|char)\s*(?:b|v|d)?\s*h\s*k\b|bhk|vhk|dhk|dbhk|vbhk|configuration|config|flat size|carpet|sq ?ft/.test(text);
   const wantsTwoBhk = /(?:2|two|to|too|do|d)\s*(?:b|v|d)?\s*h\s*k|dbhk|2bhk|two bhk|do bhk/.test(text);
@@ -631,7 +648,15 @@ function buildRuleBasedReply(session, userText = "") {
   // ── Helpers ───────────────────────────────────────────────────────────────
   const T = (en, hi) => isHindi ? hi : en;
 
-  if (/price|cost|rate|budget|how much|pricing|daam|kimat|rate|kitna|kitne|paisa/.test(text)) {
+  if (/price|cost|rate|budget|how much|pricing|daam|kimat|rate|kitna|kitne|paisa|qeemat/.test(text)) {
+    if (kbPriceSnippet) {
+      // We have actual price data from KB — give it directly
+      session.guidedState = "awaiting_callback_confirmation";
+      return T(
+        `For ${project}: ${kbPriceSnippet}. Would you like to book a site visit or get a callback with the full quote?`,
+        `${project} mein ${kbPriceSnippet}. Site visit book karein ya full quote ke liye callback chahiye?`
+      );
+    }
     session.guidedState = "awaiting_configuration";
     return T(
       `For ${project}, do you want the two BHK price or the three BHK price?`,
@@ -746,10 +771,19 @@ function isTerminalGuidedState(session) {
 function shouldUseGuidedReply(session, userText = "") {
   const text = String(userText || "").toLowerCase();
   const guidedState = session?.guidedState || null;
-  if (guidedState) {
-    return true;
+
+  // If KB context is loaded, let the LLM use it — guided replies can't access KB data.
+  // We still use guided for terminal states (callback confirmation, farewell) to close fast.
+  if (session?.dynamicVariables?.knowledge_base?.length > 50) {
+    // Only keep guided for active state machine flows — not for open-ended discovery
+    const terminalFlow = ["awaiting_callback_confirmation", "awaiting_visit_day",
+                          "callback_confirmed", "callback_declined", "closed"].includes(guidedState);
+    return terminalFlow;
   }
-  return /price|cost|rate|budget|how much|pricing|(?:\b|[^a-z0-9])(?:1|one|2|two|3|three|4|four)\s*(?:b|v|d)?\s*h\s*k\b|bhk|vhk|dhk|dbhk|vbhk|configuration|config|flat size|carpet|sq ?ft|location|where|near|connectivity|area|visit|site|schedule|appointment|callback|bye|goodbye|not interested|stop|later/.test(text);
+
+  // No KB — use guided for matching patterns or when already in a guided state
+  if (guidedState) return true;
+  return /price|cost|rate|budget|how much|pricing|daam|kimat|kitna|kitne|paisa|qeemat|(?:\b|[^a-z0-9])(?:1|one|ek|2|two|do|3|three|teen|4|four|char)\s*(?:b|v|d)?\s*h\s*k\b|bhk|vhk|dhk|dbhk|vbhk|configuration|config|flat size|carpet|sq ?ft|location|where|near|connectivity|area|kahan|jagah|visit|site|schedule|appointment|callback|bye|goodbye|not interested|stop|later|alvida|band karo/.test(text);
 }
 
 // ── LLM response — Groq fast path (50–150ms TTFT) with Ollama fallback ──────
@@ -765,13 +799,18 @@ async function getLLMResponse(session, userText) {
     return reply;
   }
 
-  // Knowledge context — only fetch for non-guided path, cap at 1200 chars to save tokens
+  // Knowledge context — only fetch for non-guided path, cap at 3000 chars
   const knowledgeContext = (
     session.dynamicVariables?.knowledge_base ||
     (await getKnowledgeContext(session.campaign?.project_id || session.lead.project_id, userText))
-  ).slice(0, 1200);
+  ).slice(0, 3000);
 
-  const systemPrompt = buildSystemPrompt(session.lead, knowledgeContext, language);
+  // Resolve language — prefer detected language over "auto" placeholder
+  const resolvedLanguage = (language === "auto" || language === "auto-IN" || !language)
+    ? (languageManager.getBaseLanguage(session.callSid) || "hi")
+    : language;
+
+  const systemPrompt = buildSystemPrompt(session.lead, knowledgeContext, resolvedLanguage);
   const messages = [{ role: "system", content: systemPrompt }, ...session.history];
 
   // ── Groq fast path (GROQ_API_KEY set) ──────────────────────────────────────
@@ -784,8 +823,8 @@ async function getLLMResponse(session, userText) {
           {
             model: process.env.GROQ_MODEL || "llama3-8b-8192",
             messages,
-            temperature: 0.3,
-            max_tokens: 80,   // keep responses short — 1–2 sentences max
+            temperature: 0.2,
+            max_tokens: 120,  // enough for 2 Hindi sentences without truncation
             stream: false,
           },
           {
@@ -911,9 +950,10 @@ async function synthesizeAndStreamReply(ws, session, fullText) {
     await recordAgentAudio(session, audio, "agent-reply");
     sendEnablexMedia(ws, session, audio, "streaming-sentence");
 
-    // Wait for this sentence to finish before sending the next chunk
-    const playMs = session.telephony?.lastPlaybackMs || 900;
-    await new Promise(r => setTimeout(r, playMs + 80));
+    // Wait for THIS sentence's playback to finish (use its own duration, not last audio's)
+    // lastPlaybackMs is updated inside sendEnablexMedia for the just-sent chunk
+    const playMs = session.telephony?.lastPlaybackMs || 800;
+    await new Promise(r => setTimeout(r, Math.min(playMs + 80, 4000)));  // cap at 4s
   }
 
   return firstSent;
@@ -1501,6 +1541,8 @@ async function processCallerUtterance(ws, session, callSid, reason = "utterance"
 
     languageManager.recordUtterance(callSid, transcription.language, transcription.text);
     session.stage = "qualification";
+    // Upgrade status so dashboard shows call is active (not stuck at stream_started)
+    if (session.status === "stream_started") session.status = "active";
 
     const t1 = Date.now();
     const reply = await getLLMResponse(session, transcription.text);
@@ -1668,6 +1710,7 @@ app.get("/sessions/:callSid", (req, res) => {
   if (!session) {
     return res.status(404).json({ call_sid: req.params.callSid, status: "completed", state: "not_found" });
   }
+  const turnCount = Math.floor((session.history?.length || 0) / 2);
   res.json({
     call_sid: session.callSid,
     status: session.status || "active",
@@ -1677,6 +1720,9 @@ app.get("/sessions/:callSid", (req, res) => {
     lead_name: session.lead?.name,
     language: languageManager.getLanguage(session.callSid),
     started_at: session.startedAt,
+    turn_count: turnCount,
+    kb_loaded: !!(session.dynamicVariables?.knowledge_base),
+    last_agent_reply: session.history?.filter(h => h.role === "assistant").slice(-1)[0]?.content?.slice(0, 100) || null,
   });
 });
 
@@ -1731,6 +1777,8 @@ app.post("/call/dial", async (req, res) => {
         greeting: openingLine,
         provider: "enablex",
         provider_response: enablexCall.raw,
+        kb_attached: !!(session.dynamicVariables?.knowledge_base),
+        kb_chars: session.dynamicVariables?.knowledge_base?.length || 0,
       });
     } catch (error) {
       return res.status(502).json({
