@@ -384,11 +384,12 @@ function nowIso() {
 
 function buildSystemPrompt(lead, knowledgeContext, language) {
   const hasKB = knowledgeContext && knowledgeContext.trim().length > 30;
-  const lang = String(language || lead.language_preference || "auto").toLowerCase();
-  const respondInHindi = lang === "hi" || lang === "hindi" || lang === "hi-in";
-  const languageInstruction = respondInHindi
-    ? "IMPORTANT: The lead is speaking Hindi. Always reply in Hindi (Devanagari or Hinglish). Never switch to English."
-    : "Mirror the lead's language — respond in the same language they use.";
+  const lang = normalizeLanguageToISO(language || lead.language_preference || lead.language || "auto");
+  const langNames = { hi: "Hindi", mr: "Marathi", ta: "Tamil", te: "Telugu", pa: "Punjabi", bn: "Bengali", gu: "Gujarati", kn: "Kannada", ml: "Malayalam", en: "English" };
+  const langLabel = langNames[lang];
+  const languageInstruction = langLabel && lang !== "en" && lang !== "auto"
+    ? `IMPORTANT: The lead is speaking ${langLabel}. Always reply in ${langLabel} (Hinglish is fine for Hindi). Never switch to English.`
+    : "Mirror the lead's language — if they speak Hindi, reply in Hindi; if English, reply in English.";
 
   return `You are Priya, a real estate sales consultant calling on behalf of ${lead.developer || "Prophunt"}.
 
@@ -1208,8 +1209,21 @@ async function endCall(session, finalStatus = "completed") {
   languageManager.clear(session.callSid);
 }
 
+// Normalize language string from dashboard ("Hindi", "English", "hi", "en", etc.) to ISO code
+function normalizeLanguageToISO(lang = "") {
+  const map = {
+    "hindi": "hi", "english": "en", "marathi": "mr", "tamil": "ta",
+    "telugu": "te", "bengali": "bn", "punjabi": "pa", "gujarati": "gu",
+    "kannada": "kn", "malayalam": "ml", "auto": "auto",
+  };
+  const lower = String(lang || "").toLowerCase().split("-")[0];
+  return map[lower] || lower || "auto";
+}
+
 function createSession(lead, campaign = {}, callSid = crypto.randomUUID()) {
-  const preferredLanguage = lead.language_preference || campaign.language || "auto";
+  // Support both "language_preference" (CRM leads) and "language" (dashboard test calls)
+  const rawLang = lead.language_preference || lead.language || campaign.language || "auto";
+  const preferredLanguage = normalizeLanguageToISO(rawLang);
   languageManager.initialize(callSid, preferredLanguage);
   const session = {
     callSid,
