@@ -565,6 +565,52 @@ async function transcribeAudio(audioBuffer, language = "auto") {
   return response.data;
 }
 
+// ── Direct Sarvam STT — bypasses internal STT microservice, saves one hop ────
+// Sarvam accepts: POST /speech-to-text  multipart { file, model, language_code }
+// Response: { transcript, language_code, ... }
+const SARVAM_LANG_MAP = {
+  "hi": "hi-IN", "en": "en-IN", "mr": "mr-IN",
+  "ta": "ta-IN", "te": "te-IN", "kn": "kn-IN",
+  "gu": "gu-IN", "bn": "bn-IN", "pa": "pa-IN",
+};
+
+async function transcribeAudioDirect(audioBuffer, language = "auto") {
+  const sarvamKey = process.env.SARVAM_API_KEY;
+  // Fall back to microservice if no key (shouldn't happen — key is set on Railway)
+  if (!sarvamKey) return transcribeAudio(audioBuffer, language);
+
+  const wav = ensureWavBuffer(audioBuffer);
+  const form = new FormData();
+  form.append("file", wav, { filename: "audio.wav", contentType: "audio/wav" });
+  form.append("model", "saarika:v2");
+
+  const langCode = SARVAM_LANG_MAP[language] || (language === "auto" ? undefined : language);
+  if (langCode) form.append("language_code", langCode);
+
+  try {
+    const t0 = Date.now();
+    const response = await timed("stt_direct", () =>
+      axios.post(
+        `${process.env.SARVAM_API_URL || "https://api.sarvam.ai"}/speech-to-text`,
+        form,
+        {
+          headers: { ...form.getHeaders(), "api-subscription-key": sarvamKey },
+          timeout: 12000,
+        }
+      )
+    );
+    const d = response.data;
+    console.log(`[stt-direct] latency=${Date.now()-t0}ms lang=${d.language_code}`);
+    return {
+      text:     d.transcript || "",
+      language: d.language_code?.split("-")[0] || language,
+    };
+  } catch (err) {
+    console.warn("[stt-direct] failed, falling back to microservice:", err.message);
+    return transcribeAudio(audioBuffer, language);  // graceful fallback
+  }
+}
+
 function buildRuleBasedReply(session, userText = "") {
   const text = String(userText || "").toLowerCase();
   const project = session.lead?.project || session.campaign?.project_name || "the project";
@@ -1418,8 +1464,32 @@ async function processCallerUtterance(ws, session, callSid, reason = "utterance"
     const t0 = Date.now();
     console.log(`[enablex-media] processing utterance callSid=${callSid} reason=${reason} bytes=${utteranceAudio.length}`);
 
-    const transcription = await transcribeAudio(utteranceAudio, "auto");
-    console.log(`[stt] callSid=${callSid} latency=${Date.now()-t0}ms text="${transcription.text || ""}" lang=${transcription.language || ""}`);
+    // ── STT: use speculative result if available, otherwise fire fresh ────────
+    // Speculative path: promise was fired 160ms+ ago and may already be resolved.
+    // If the speculative audio was shorter (we collected more after firing),
+    // check if the extra audio changes things — if > 30% more bytes, re-transcribe.
+    let transcription;
+    const specPromise = inbound.speculativePromise;
+    const specBytes   = inbound.speculativeAudio?.length || 0;
+    const extraRatio  = specBytes > 0 ? utteranceAudio.length / specBytes : 2;
+    inbound.speculativePromise = null;
+    inbound.speculativeAudio   = null;
+
+    if (specPromise && extraRatio < 2.0) {
+      // Audio didn't grow much — speculative transcription covers most of the utterance
+      transcription = await specPromise;
+      if (!transcription?.text) {
+        // Speculative failed, run full transcription now
+        transcription = await transcribeAudioDirect(utteranceAudio, languageManager.getBaseLanguage(callSid) || "auto");
+      }
+      console.log(`[stt] SPECULATIVE callSid=${callSid} wait=${Date.now()-t0}ms text="${transcription?.text || ""}"`);
+    } else {
+      // Utterance grew significantly after speculative fired — full audio is more accurate
+      const baseLang = languageManager.getBaseLanguage(callSid) || "auto";
+      transcription = await transcribeAudioDirect(utteranceAudio, baseLang);
+      console.log(`[stt] FRESH callSid=${callSid} latency=${Date.now()-t0}ms text="${transcription?.text || ""}"`);
+    }
+    console.log(`[stt] result: "${transcription?.text || ""}" lang=${transcription?.language || ""} elapsed=${Date.now()-t0}ms`);
     if (!transcription.text) return;
 
     // Allow short acks ("haan", "ok", "ji") — only filter pure noise (< 2 words)
@@ -1487,9 +1557,19 @@ async function processCallerUtterance(ws, session, callSid, reason = "utterance"
   }
 }
 
+// ── SPECULATIVE_STT_FRAMES: fire STT after this many speech frames ─────────────
+// 8 frames × 20ms = 160ms of speech → Sarvam starts processing while we still
+// collect audio. By the time silence fires (~240ms later) Sarvam is nearly done.
+const SPECULATIVE_STT_FRAMES = 8;
+
 async function handleCallerAudioFrame(ws, session, callSid, audioBuffer) {
   if (!session.inboundAudio) {
-    session.inboundAudio = { chunks: [], speechFrames: 0, silenceFrames: 0, processing: false, lastFlushAt: Date.now() };
+    session.inboundAudio = {
+      chunks: [], speechFrames: 0, silenceFrames: 0,
+      processing: false, lastFlushAt: Date.now(),
+      speculativePromise: null,  // in-flight STT request fired early
+      speculativeAudio: null,    // audio snapshot sent speculatively
+    };
   }
   await recordCallerAudio(session, audioBuffer, "caller-media");
 
@@ -1502,10 +1582,13 @@ async function handleCallerAudioFrame(ws, session, callSid, audioBuffer) {
   const inbound = session.inboundAudio;
   const hasSpeech = detectSpeech(audioBuffer); // sync — no HTTP, ~0.05ms
 
-  // Barge-in: if caller speaks while agent is playing audio, cancel agent and start listening immediately
+  // Barge-in: caller speaks while agent is playing → cancel agent audio immediately
   if (hasSpeech && session.telephony?.agentSpeakingUntil && Date.now() < session.telephony.agentSpeakingUntil) {
     clearEnablexMedia(ws, session);
     session.telephony.agentSpeakingUntil = 0;
+    // Reset any speculative job — audio collected during agent speech is barge-in noise
+    inbound.speculativePromise = null;
+    inbound.speculativeAudio   = null;
     console.log(`[enablex-media] barge-in detected callSid=${callSid}`);
   }
 
@@ -1514,26 +1597,36 @@ async function handleCallerAudioFrame(ws, session, callSid, audioBuffer) {
   }
 
   const isCollecting = inbound.chunks.length > 0;
-
-  if (hasSpeech || isCollecting) {
-    inbound.chunks.push(audioBuffer);
-  }
-
+  if (hasSpeech || isCollecting) inbound.chunks.push(audioBuffer);
   if (inbound.processing) return;
 
   if (hasSpeech) {
     inbound.speechFrames += 1;
     inbound.silenceFrames = 0;
+
+    // ── Speculative STT: fire early after 8 frames (160ms) ──────────────────
+    // Sarvam processes in parallel with remaining audio collection.
+    // When silence triggers (240ms later), the STT is ~80% done already.
+    if (inbound.speechFrames === SPECULATIVE_STT_FRAMES && !inbound.speculativePromise && !inbound.processing) {
+      const earlySnap = Buffer.concat(inbound.chunks);
+      const lang = languageManager.getLanguage(callSid);
+      const baseLang = languageManager.getBaseLanguage(callSid) || "auto";
+      inbound.speculativeAudio   = earlySnap;
+      inbound.speculativePromise = transcribeAudioDirect(earlySnap, baseLang)
+        .catch(err => {
+          console.warn(`[speculative-stt] failed callSid=${callSid}:`, err.message);
+          return null;
+        });
+      console.log(`[speculative-stt] fired at ${inbound.speechFrames} frames callSid=${callSid}`);
+    }
     return;
   }
 
   if (!isCollecting) return;
   inbound.silenceFrames += 1;
   const bufferedMs = inbound.chunks.length * 20;
-  // 8 speech frames = 160ms minimum speech (was 12 = 240ms)
   const enoughSpeech = inbound.speechFrames >= 8 || bufferedMs >= 1500;
-  // 12 silence frames = 240ms silence wait (was 25 = 500ms) — still avoids mid-sentence cuts
-  const endedBySilence = inbound.silenceFrames >= 12;
+  const endedBySilence = inbound.silenceFrames >= 12;  // 240ms silence
   const tooLong = bufferedMs >= 10000;
 
   if ((enoughSpeech && endedBySilence) || tooLong) {
