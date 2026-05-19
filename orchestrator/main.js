@@ -517,18 +517,27 @@ async function getKnowledgeContext(projectId, transcript) {
   }
 }
 
-async function detectSpeech(audioChunk) {
-  try {
-    const response = await timed("vad", () =>
-      axios.post(`${config.services.vad}/detect`, audioChunk, {
-        headers: { "Content-Type": "application/octet-stream" },
-        timeout: 500,
-      })
-    );
-    return response.data.is_speech;
-  } catch {
-    return false;
+// ── In-process VAD — RMS energy + zero-crossing rate (~0.05ms vs ~15ms HTTP) ──
+// Eliminates one HTTP round-trip per 20ms audio frame. Tune VAD_THRESHOLD env var.
+const VAD_RMS_THRESHOLD     = parseInt(process.env.VAD_THRESHOLD      || "420", 10);
+const VAD_ZCR_THRESHOLD     = parseFloat(process.env.VAD_ZCR_THRESHOLD || "0.08");
+
+function detectSpeech(pcm16Buffer) {
+  if (!pcm16Buffer || pcm16Buffer.length < 4) return false;
+  const samples = Math.floor(pcm16Buffer.length / 2);
+  let sumSq = 0, zeroCrossings = 0;
+  let prev = 0;
+  for (let i = 0; i < pcm16Buffer.length - 1; i += 2) {
+    const s = pcm16Buffer.readInt16LE(i);
+    sumSq += s * s;
+    if ((s >= 0) !== (prev >= 0)) zeroCrossings++;
+    prev = s;
   }
+  const rms = Math.sqrt(sumSq / samples);
+  const zcr = zeroCrossings / samples;
+  // Speech has both energy (rms) AND frequency content (zcr).
+  // Pure silence has low rms. Background noise has low zcr.
+  return rms > VAD_RMS_THRESHOLD && zcr > VAD_ZCR_THRESHOLD;
 }
 
 async function detectLanguage(audioBuffer) {
@@ -697,45 +706,81 @@ function shouldUseGuidedReply(session, userText = "") {
   return /price|cost|rate|budget|how much|pricing|(?:\b|[^a-z0-9])(?:1|one|2|two|3|three|4|four)\s*(?:b|v|d)?\s*h\s*k\b|bhk|vhk|dhk|dbhk|vbhk|configuration|config|flat size|carpet|sq ?ft|location|where|near|connectivity|area|visit|site|schedule|appointment|callback|bye|goodbye|not interested|stop|later/.test(text);
 }
 
+// ── LLM response — Groq fast path (50–150ms TTFT) with Ollama fallback ──────
 async function getLLMResponse(session, userText) {
   const language = languageManager.getLanguage(session.callSid);
-  const knowledgeContext = await getKnowledgeContext(session.campaign?.project_id || session.lead.project_id, userText);
   session.history.push({ role: "user", content: userText });
   session.history = session.history.slice(-12);
+
+  // Guided reply path — pure in-memory, ~0ms (handles pricing/BHK/location/callback)
   if (shouldUseGuidedReply(session, userText)) {
     const reply = buildRuleBasedReply(session, userText);
     session.history.push({ role: "assistant", content: reply });
     return reply;
   }
+
+  // Knowledge context — only fetch for non-guided path, cap at 1200 chars to save tokens
+  const knowledgeContext = (
+    session.dynamicVariables?.knowledge_base ||
+    (await getKnowledgeContext(session.campaign?.project_id || session.lead.project_id, userText))
+  ).slice(0, 1200);
+
+  const systemPrompt = buildSystemPrompt(session.lead, knowledgeContext, language);
+  const messages = [{ role: "system", content: systemPrompt }, ...session.history];
+
+  // ── Groq fast path (GROQ_API_KEY set) ──────────────────────────────────────
+  if (process.env.GROQ_API_KEY) {
+    try {
+      const t0 = Date.now();
+      const response = await timed("groq", () =>
+        axios.post(
+          "https://api.groq.com/openai/v1/chat/completions",
+          {
+            model: process.env.GROQ_MODEL || "llama3-8b-8192",
+            messages,
+            temperature: 0.3,
+            max_tokens: 80,   // keep responses short — 1–2 sentences max
+            stream: false,
+          },
+          {
+            headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+            timeout: 4000,
+          }
+        )
+      );
+      const reply = response.data.choices?.[0]?.message?.content || languageManager.fallback(session.callSid);
+      console.log(`[groq] callSid=${session.callSid} latency=${Date.now()-t0}ms reply="${reply.slice(0,60)}"`);
+      session.history.push({ role: "assistant", content: reply });
+      const match = reply.match(/OUTCOME:({.*})/s);
+      if (match) { try { session.outcome = JSON.parse(match[1]); } catch {} }
+      return reply.replace(/OUTCOME:({.*})/s, "").trim();
+    } catch (err) {
+      console.warn("[groq] failed, falling back to Ollama:", err.message);
+    }
+  }
+
+  // ── Ollama fallback ─────────────────────────────────────────────────────────
   try {
     const response = await timed("llm", () =>
       axios.post(
         `${config.services.llm}/v1/chat/completions`,
         {
           model: process.env.LLM_MODEL || "llama3:latest",
-          messages: [{ role: "system", content: buildSystemPrompt(session.lead, knowledgeContext, language) }, ...session.history],
+          messages,
           temperature: 0.35,
-          max_tokens: 110,
+          max_tokens: 80,
           stream: false,
         },
-        { timeout: parseInt(process.env.LLM_REQUEST_TIMEOUT_MS || "45000", 10) }
+        { timeout: parseInt(process.env.LLM_REQUEST_TIMEOUT_MS || "20000", 10) }
       )
     );
     const reply = response.data.choices?.[0]?.message?.content || languageManager.fallback(session.callSid);
     session.history.push({ role: "assistant", content: reply });
     const match = reply.match(/OUTCOME:({.*})/s);
-    if (match) {
-      try {
-        session.outcome = JSON.parse(match[1]);
-      } catch {}
-    }
+    if (match) { try { session.outcome = JSON.parse(match[1]); } catch {} }
     return reply.replace(/OUTCOME:({.*})/s, "").trim();
   } catch (error) {
-    console.warn("[llm] response failed, using guided fallback", {
-      callSid: session.callSid,
-      message: error.message,
-      status: error.response?.status,
-    });
+    console.warn("[llm] all LLM paths failed, using guided fallback", { callSid: session.callSid, message: error.message });
     const reply = buildRuleBasedReply(session, userText);
     session.history.push({ role: "assistant", content: reply });
     return reply;
@@ -780,6 +825,53 @@ const SARVAM_VOICE_MAP = {
   bn: { female: "shreya", male: "shreya" },
   en: { female: "priya", male: "shubh" },
 };
+
+// Split reply into natural sentence chunks for streaming delivery
+function splitIntoSentences(text) {
+  // Split on Hindi/English sentence endings: . ! ? । and ellipsis
+  const parts = text.split(/(?<=[.!?।…])\s+/).map(s => s.trim()).filter(Boolean);
+  if (parts.length <= 1) return [text];
+  // Merge sentences that are too short (< 6 words) with the next one
+  const merged = [];
+  let buf = '';
+  for (const s of parts) {
+    buf = buf ? buf + ' ' + s : s;
+    if (buf.split(/\s+/).length >= 6 || s === parts[parts.length - 1]) {
+      merged.push(buf.trim());
+      buf = '';
+    }
+  }
+  if (buf) merged.push(buf.trim());
+  return merged.length ? merged : [text];
+}
+
+// Stream reply sentence-by-sentence — lead hears first sentence ~200ms sooner
+async function synthesizeAndStreamReply(ws, session, fullText) {
+  const sentences = splitIntoSentences(fullText);
+  let firstSent = false;
+
+  for (const sentence of sentences) {
+    if (!sentence || session.closed || session.telephony?.hangupScheduled) break;
+
+    const audio = await synthesizeSpeech(session, sentence);
+    if (!audio) continue;
+
+    if (!firstSent) {
+      clearEnablexMedia(ws, session);  // cancel any previous audio
+      firstSent = true;
+    }
+
+    if (ws.readyState !== WebSocket.OPEN) break;
+    await recordAgentAudio(session, audio, "agent-reply");
+    sendEnablexMedia(ws, session, audio, "streaming-sentence");
+
+    // Wait for this sentence to finish before sending the next chunk
+    const playMs = session.telephony?.lastPlaybackMs || 900;
+    await new Promise(r => setTimeout(r, playMs + 80));
+  }
+
+  return firstSent;
+}
 
 async function synthesizeSpeech(session, text) {
   const gender = session.campaign?.voice_gender || session.lead.voice_gender || "female";
@@ -1019,10 +1111,49 @@ function createSession(lead, campaign = {}, callSid = crypto.randomUUID()) {
     recordingPath: null,
     telephony: null,
     pendingGreetingAudio: null,
+    dynamicVariables: null,  // set by /call/dial from dashboard KB payload
+    _ttsCache: {},           // pre-warmed audio for common phrases
   };
   session.timer = setTimeout(() => endCall(session, "timeout"), config.callTimeoutMs);
   sessions.set(callSid, session);
   return session;
+}
+
+// Pre-warm TTS for the most frequent agent phrases so they play from cache instantly.
+// Called after session creation — runs in background, doesn't block the dial response.
+async function prewarmTTSCache(session) {
+  const lang = languageManager.getBaseLanguage(session.callSid) || "hi";
+  const phrases = lang === "hi" ? [
+    "Ek second.",
+    "Samajh gaya.",
+    "Bilkul.",
+    "Koi baat nahi. Aapka shukriya. Namaste.",
+    "Kya aap do BHK ya teen BHK mein interested hain?",
+  ] : [
+    "One moment.",
+    "Got it.",
+    "Sure.",
+    "Thank you for your time. Goodbye.",
+    "Are you looking for a two BHK or three BHK?",
+  ];
+  for (const phrase of phrases) {
+    try {
+      const audio = await synthesizeSpeech(session, phrase);
+      if (audio) session._ttsCache[phrase.toLowerCase().trim()] = audio;
+    } catch { /* non-fatal */ }
+  }
+  console.log(`[tts-cache] warmed ${Object.keys(session._ttsCache).length} phrases callSid=${session.callSid}`);
+}
+
+// Wrap synthesizeSpeech to hit cache first
+const _origSynthesize = synthesizeSpeech;
+async function synthesizeSpeechCached(session, text) {
+  const key = text.toLowerCase().trim();
+  if (session._ttsCache?.[key]) {
+    console.log(`[tts-cache] HIT callSid=${session.callSid}`);
+    return session._ttsCache[key];
+  }
+  return _origSynthesize(session, text);
 }
 
 function remapSessionCallSid(session, nextCallSid) {
@@ -1275,53 +1406,58 @@ async function processCallerUtterance(ws, session, callSid, reason = "utterance"
   inbound.silenceFrames = 0;
   inbound.lastFlushAt = Date.now();
 
-  // Skip utterances that are too short to contain meaningful speech (< 0.5s of audio)
-  const MIN_UTTERANCE_BYTES = 8000;
+  // 3200 bytes = 200ms of audio — catches short acks like "haan", "ji", "ok" (was 8000 = 500ms)
+  const MIN_UTTERANCE_BYTES = 3200;
   if (utteranceAudio.length < MIN_UTTERANCE_BYTES) {
-    console.log(`[enablex-media] skipping short utterance callSid=${callSid} reason=${reason} bytes=${utteranceAudio.length}`);
+    console.log(`[enablex-media] skipping short utterance callSid=${callSid} bytes=${utteranceAudio.length}`);
     inbound.processing = false;
     return;
   }
 
   try {
-    console.log(`[enablex-media] processing caller utterance callSid=${callSid} reason=${reason} bytes=${utteranceAudio.length}`);
+    const t0 = Date.now();
+    console.log(`[enablex-media] processing utterance callSid=${callSid} reason=${reason} bytes=${utteranceAudio.length}`);
+
     const transcription = await transcribeAudio(utteranceAudio, "auto");
-    console.log(`[stt] caller utterance callSid=${callSid} text="${transcription.text || ""}" language=${transcription.language || ""}`);
+    console.log(`[stt] callSid=${callSid} latency=${Date.now()-t0}ms text="${transcription.text || ""}" lang=${transcription.language || ""}`);
     if (!transcription.text) return;
-    // Skip transcriptions that are too short — likely noise or fragment (< 3 meaningful words)
-    const wordCount = transcription.text.trim().split(/\s+/).filter(w => w.length > 1).length;
-    if (wordCount < 3) {
-      console.log(`[enablex-media] skipping fragment callSid=${callSid} words=${wordCount} text="${transcription.text}"`);
+
+    // Allow short acks ("haan", "ok", "ji") — only filter pure noise (< 2 words)
+    const wordCount = transcription.text.trim().split(/\s+/).filter(w => w.length > 0).length;
+    if (wordCount < 2) {
+      console.log(`[enablex-media] skipping noise callSid=${callSid} words=${wordCount}`);
       return;
     }
+
     languageManager.recordUtterance(callSid, transcription.language, transcription.text);
     session.stage = "qualification";
-    let reply = await getLLMResponse(session, transcription.text);
-    console.log(`[agent] reply callSid=${callSid} text="${reply}"`);
-    let speech = await synthesizeSpeech(session, reply);
-    if (!speech) {
-      reply =
-        "I can help with that. Pricing depends on configuration, floor, and availability. Are you looking for a two BHK or a three BHK?";
-      console.warn("[enablex-media] retrying reply with compact fallback", { callSid, reply });
-      speech = await synthesizeSpeech(session, reply);
-    }
-    if (speech && ws.readyState === WebSocket.OPEN) {
-      clearEnablexMedia(ws, session);
-      await recordAgentAudio(session, speech, "agent-reply");
-      sendEnablexMedia(ws, session, speech, "reply");
-      if (isTerminalGuidedState(session)) {
-        scheduleAgentSideHangup(ws, session, session.guidedState);
+
+    const t1 = Date.now();
+    const reply = await getLLMResponse(session, transcription.text);
+    console.log(`[agent] callSid=${callSid} llm=${Date.now()-t1}ms total_to_llm=${Date.now()-t0}ms reply="${reply.slice(0,60)}"`);
+
+    // Stream sentence-by-sentence — lead hears first word sooner
+    const streamed = await synthesizeAndStreamReply(ws, session, reply);
+
+    if (!streamed) {
+      // Fallback: synthesize full reply in one shot
+      const speech = await synthesizeSpeech(session, reply) ||
+        await synthesizeSpeech(session, "Main samajh raha hoon. Kya aap do BHK ya teen BHK mein interested hain?");
+      if (speech && ws.readyState === WebSocket.OPEN) {
+        clearEnablexMedia(ws, session);
+        await recordAgentAudio(session, speech, "agent-reply");
+        sendEnablexMedia(ws, session, speech, "reply");
       }
-    } else {
-      console.warn("[enablex-media] reply speech unavailable", {
-        callSid,
-        websocketOpen: ws.readyState === WebSocket.OPEN,
-        reply,
-      });
     }
+
+    if (isTerminalGuidedState(session)) {
+      scheduleAgentSideHangup(ws, session, session.guidedState);
+    }
+
+    console.log(`[agent] total_latency=${Date.now()-t0}ms callSid=${callSid}`);
     await persistSession(session);
   } catch (error) {
-    console.warn("[enablex-media] caller utterance handling failed", { callSid, message: error.message });
+    console.warn("[enablex-media] utterance handling failed", { callSid, message: error.message });
     const fallback = languageManager.fallback(callSid);
     const speech = await synthesizeSpeech(session, fallback);
     if (speech && ws.readyState === WebSocket.OPEN) {
@@ -1364,7 +1500,7 @@ async function handleCallerAudioFrame(ws, session, callSid, audioBuffer) {
   }
 
   const inbound = session.inboundAudio;
-  const hasSpeech = await detectSpeech(audioBuffer);
+  const hasSpeech = detectSpeech(audioBuffer); // sync — no HTTP, ~0.05ms
 
   // Barge-in: if caller speaks while agent is playing audio, cancel agent and start listening immediately
   if (hasSpeech && session.telephony?.agentSpeakingUntil && Date.now() < session.telephony.agentSpeakingUntil) {
@@ -1394,11 +1530,10 @@ async function handleCallerAudioFrame(ws, session, callSid, audioBuffer) {
   if (!isCollecting) return;
   inbound.silenceFrames += 1;
   const bufferedMs = inbound.chunks.length * 20;
-  // Require at least 12 speech frames (240ms) before considering an utterance valid
-  const enoughSpeech = inbound.speechFrames >= 12 || bufferedMs >= 2000;
-  // Wait for 25 silence frames (500ms) before cutting — prevents chopping mid-sentence
-  const endedBySilence = inbound.silenceFrames >= 25;
-  // Allow up to 10 seconds of buffering for long utterances
+  // 8 speech frames = 160ms minimum speech (was 12 = 240ms)
+  const enoughSpeech = inbound.speechFrames >= 8 || bufferedMs >= 1500;
+  // 12 silence frames = 240ms silence wait (was 25 = 500ms) — still avoids mid-sentence cuts
+  const endedBySilence = inbound.silenceFrames >= 12;
   const tooLong = bufferedMs >= 10000;
 
   if ((enoughSpeech && endedBySilence) || tooLong) {
@@ -1471,6 +1606,8 @@ app.post("/call/dial", async (req, res) => {
   await persistSession(session);
   const greeting = await getOpeningMessage(session);
   session.pendingGreetingAudio = await synthesizeSpeech(session, greeting);
+  // Pre-warm TTS cache in background — ready before call connects
+  prewarmTTSCache(session).catch(() => {});
   const provider = resolveTelephonyProvider(req.body.provider);
 
   if (provider === "enablex") {
